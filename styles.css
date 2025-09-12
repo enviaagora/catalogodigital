@@ -329,7 +329,7 @@ button{font:inherit}
    =========================== */
 .card{
   background:var(--paper); border-radius:var(--radius); box-shadow:var(--shadow);
-  padding:14px; display:grid; grid-template-columns:1fr 120px; gap:14px; align-items:center;
+  padding:14px; display:grid; grid-template-columns:1fr 180px; gap:14px; align-items:center;
        margin-top: 15px;
 }
 .card + .card{margin-top:14px}
@@ -341,7 +341,7 @@ button{font:inherit}
 .card .add-carrinho:hover{filter:brightness(.95)}
 
 /* Página do produto */
-#produto-in{display:grid;grid-template-columns:210px 1fr;gap:16px;background:var(--paper);padding:16px;border-radius:var(--radius);box-shadow:var(--shadow)}
+#produto-in{display:grid;grid-template-columns:280px 1fr;gap:16px;background:var(--paper);padding:16px;border-radius:var(--radius);box-shadow:var(--shadow)}
 #produto-in .produto-img{width:100%;height:220px;object-fit:cover}
 #produto-in .nome-produto{font-size:20px;font-weight:900;display:block;margin-bottom:6px}
 #produto-in .preco-produto{display:inline-block;margin:6px 0 12px}
