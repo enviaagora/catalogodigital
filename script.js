@@ -312,30 +312,6 @@ function getDeliveryFeesFromWidget(){
   for (var i=0;i<anchors.length;i++){ if (/taxa|entrega/.test(anchors[i].lower)){ item = anchors[i]; break; } }
   return parseFeesString(item && item.value);
 }
-// --- FERIADOS (dd-mm ou dd/mm, separados por vírgula/ponto-e-vírgula/linha) ---
-function parseHolidayList(s){
-  s = String(s||'').trim(); if(!s) return [];
-  return s.split(/[,;\n]+/).map(t=>{
-    const m = String(t||'').trim().match(/^(\d{1,2})[\/\-](\d{1,2})$/);
-    if(!m) return null;
-    const d = Math.max(1, Math.min(31, parseInt(m[1],10)||0));
-    const mth = Math.max(1, Math.min(12, parseInt(m[2],10)||0));
-    return d && mth ? {d, m:mth} : null;
-  }).filter(Boolean);
-}
-function getHolidaysFromWidget(){
-  const anchors = _getConfigAnchors();
-  let item = null;
-  for (let i=0;i<anchors.length;i++){
-    if (/feriado/.test(anchors[i].lower)){ item = anchors[i]; break; }
-  }
-  return parseHolidayList(item && item.value);
-}
-function isHoliday(date){
-  const list = (window.__HOLIDAYS__||[]);
-  const d = date.getDate(), m = date.getMonth()+1;
-  return list.some(h => h.d===d && h.m===m);
-}
 
 
 
@@ -838,7 +814,6 @@ document.addEventListener('DOMContentLoaded', function(){
   TAXAS_ENTREGA = getDeliveryFeesFromWidget() || [];
   ensureBairroUI();
   CUPONS_DISPONIVEIS = getCouponsFromWidget() || [];
-  window.__HOLIDAYS__ = getHolidaysFromWidget() || [];
   loadActiveCoupon();
   ensureCupomUI();
   atualizarResumoFinalizar();
@@ -889,7 +864,7 @@ document.addEventListener('DOMContentLoaded', function(){
 
     if (!headerRoot) return;
 
-    /* ====== STATUS ====== */
+/* ====== STATUS ====== */
 
 (function(){
   'use strict';
@@ -898,7 +873,6 @@ document.addEventListener('DOMContentLoaded', function(){
   function norm(s){
     return String(s||'').normalize('NFD').replace(/\p{Diacritic}/gu,'').toLowerCase().trim();
   }
-  // unifica nomes de dias (com/sem "-feira", abreviações)
   function canonDay(s){
     const n = norm(s).replace(/\s*-\s*feira$/,'');
     if (/^dom/.test(n)) return 'domingo';
@@ -922,70 +896,206 @@ document.addEventListener('DOMContentLoaded', function(){
     return canonDay(new Intl.DateTimeFormat('pt-BR',{weekday:'long'}).format(d));
   }
 
-  /* ---------- lê a tabela .open-hours ---------- */
+  /* ---------- parser com múltiplos intervalos ---------- */
+  // Aceita "07:00 às 11:00; 12:00 às 18:00" (também "," ou " e ") e "às|as"
+  function parseAllRanges(txt){
+    const out = [];
+    const re = /(\d{1,2}:\d{2})\s*(?:às|as)\s*(\d{1,2}:\d{2})/gi;
+    let m;
+    while ((m = re.exec(String(txt||'')))){
+      const a = parseTime(m[1]), b = parseTime(m[2]);
+      if (a===null || b===null || a===b) continue; // 00:00–00:00 => fechado
+      out.push({ start:a, end:b, overnight:(b<a) });
+    }
+    return out;
+  }
+
+
+
+    /* ---------- FERIADOS (lê do LinkList "Feriados") ---------- */
+  function __collectConfigAnchors(){
+    // Varre a seção de configuração e todos os LinkList
+    const sels = [
+      'b\\:section#configuracao a',
+      '#configuracao.section a',
+      '#configuracao a',
+      '[id^="LinkList"] .widget-content a'
+    ];
+    const out = [];
+    sels.forEach(sel=>{
+      document.querySelectorAll(sel).forEach(a=>{
+        const name  = (a.textContent||'').trim();
+        const value = (a.getAttribute('href') || a.textContent || '').trim();
+        out.push({ name, lower: name.toLowerCase(), value });
+      });
+    });
+    return out;
+  }
+
+  function parseHolidaysString(s){
+    // Aceita: 25/12, 25-12, 01/01, 1/1; separadores , ; \n
+    const set = new Set();
+    String(s||'').split(/[,;\n]+/).forEach(token=>{
+      const t = String(token||'').trim();
+      if (!t) return;
+      const m = t.match(/^(\d{1,2})[\/\-.](\d{1,2})(?:[\/\-.]\d{2,4})?$/);
+      if (!m) return;
+      const dd = Math.max(1, Math.min(31, parseInt(m[1],10)||0));
+      const mm = Math.max(1, Math.min(12, parseInt(m[2],10)||0));
+      if (!dd || !mm) return;
+      set.add(String(mm).padStart(2,'0') + '-' + String(dd).padStart(2,'0')); // MM-DD
+    });
+    return set;
+  }
+
+  let __HOL_CACHE = null;
+  function getHolidaySet(){
+    if (__HOL_CACHE) return __HOL_CACHE;
+    const anchors = __collectConfigAnchors();
+    let raw = '';
+    anchors.forEach(a=>{
+      if (/\bferiad/.test(a.lower)) raw += (raw ? ',' : '') + a.value;
+    });
+    __HOL_CACHE = parseHolidaysString(raw);
+    return __HOL_CACHE;
+  }
+
+  function isHolidayDate(d){
+    const mmdd = String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+    return getHolidaySet().has(mmdd);
+  }
+
+
+
+  
+  /* ---------- lê a tabela .open-hours (agora com vários intervalos) ---------- */
   function getSchedule(){
     const rows=[...document.querySelectorAll('.open-hours tr')];
     if(!rows.length) return null;
     const map={};
     rows.forEach(tr=>{
-      const day = canonDay(tr.children?.[0]?.textContent || '');
-      const txt = (tr.children?.[1]?.textContent || '').trim();
+      const day = canonDay(tr.children && tr.children[0] ? tr.children[0].textContent : '');
+      const txt = (tr.children && tr.children[1] ? tr.children[1].textContent : '').trim();
       const low = norm(txt);
-      // fechado: vazio, "Fechado", traço, ou 00:00 às 00:00
-      if(!txt || /fechado|—|^-+$/.test(low)){ map[day]=null; return; }
-      const mm=/(\d{1,2}:\d{2})\s*às\s*(\d{1,2}:\d{2})/i.exec(txt);
-      if(!mm){ map[day]=null; return; }
-      const a=parseTime(mm[1]), b=parseTime(mm[2]);
-      if(a===null||b===null||a===b){ map[day]=null; return; } // 00:00–00:00 => fechado
-      map[day]={start:a,end:b,overnight:(b<a)}; // overnight: ex 20:00–02:00
+      if (!map[day]) map[day] = []; // acumula por dia
+
+      // fechado explícito
+      if(!txt || /fechado|—|^-+$/.test(low)){ return; }
+
+      const ranges = parseAllRanges(txt);
+      if (ranges.length) map[day].push(...ranges);
     });
+
+    // dias sem intervalo => null (compatível com seu código)
+    Object.keys(map).forEach(k=>{ if (!map[k].length) map[k] = null; });
     return map;
   }
 
-  /* ---------- estado aberto/fechado ---------- */
-function calcNextOpenText(sched, now){
-  const minsNow = now.getHours()*60 + now.getMinutes();
-  // varre hoje + próximos 7 dias
-  for (let i=0;i<=7;i++){
-    const d = new Date(now); d.setDate(now.getDate()+i);
-    if (window.isHoliday && window.isHoliday(d)) continue; // pula feriado
-
-    const k = todayKey(d); const s = sched[k];
-    if (!s) continue;
-
-    if (i===0){
-      // hoje: só faz sentido se ainda não abriu (ou abrirá depois)
-      if (!s.overnight && minsNow < s.start){
-        return 'Abrimos às ' + fmtHM(s.start);
-      }
-      // overnight hoje (ex: 20:00–02:00): se ainda não começou e é hoje
-      if (s.overnight && (minsNow < s.start)){
-        return 'Abrimos às ' + fmtHM(s.start);
-      }
-      continue;
-    }
-    // amanhã ou “em breve”
-    return (i===1 ? 'Amanhã' : 'Em breve') + ' às ' + fmtHM(s.start);
+  /* ---------- estado aberto/fechado + próxima abertura/fechamento ---------- */
+  function inRange(mins, r){
+    return r.overnight ? (mins >= r.start || mins <= r.end)
+                       : (mins >= r.start && mins <= r.end);
   }
-  return '';
+
+  function _statusNow(){
+    const sched = getSchedule();
+    if (!sched) return { open:null, nextOpen:null, closeMins:null };
+
+    const now  = new Date();
+    const mins = now.getHours()*60 + now.getMinutes();
+
+    const today = todayKey(now);
+    const yd    = new Date(now); yd.setDate(now.getDate()-1);
+    const yKey  = todayKey(yd);
+
+    // Se hoje é feriado, trata como dia totalmente fechado
+    const holidayToday = isHolidayDate(now);
+
+    const todayRanges = holidayToday ? [] :
+      (Array.isArray(sched[today]) ? sched[today] : []);
+
+    // NÃO permite madrugada do dia anterior entrar em feriado
+    const yRangesOver = holidayToday ? [] :
+      ((Array.isArray(sched[yKey]) ? sched[yKey] : []).filter(r=>r.overnight));
+
+    // aberto agora?
+    let active = todayRanges.find(r => inRange(mins, r));
+    if (!active) active = yRangesOver.find(r => mins <= r.end);
+
+    const open = !!active;
+    const closeMins = open ? active.end : null;
+
+    // próxima abertura
+    let nextOpen = null;
+    if (!open){
+      // hoje ainda abre mais tarde? (só se não for feriado)
+      if (!holidayToday){
+        const later = todayRanges.map(r=>r.start).filter(s=>s>mins).sort((a,b)=>a-b);
+        if (later.length){
+          nextOpen = { dayKey: today, startMins: later[0], offset: 0 };
+        }
+      }
+      // procura nos próximos dias, pulando feriados
+      if (!nextOpen){
+        for (let i=1; i<=14; i++){ // até 2 semanas de folga
+          const d = new Date(now); d.setDate(now.getDate()+i);
+          if (isHolidayDate(d)) continue;
+          const k  = todayKey(d);
+          const rs = Array.isArray(sched[k]) ? sched[k] : [];
+          if (rs.length){
+            nextOpen = { dayKey: k, startMins: rs.map(r=>r.start).sort((a,b)=>a-b)[0], offset: i };
+            break;
+          }
+        }
+      }
+    }
+    return { open, nextOpen, closeMins };
+  }
+
+
+function calcNextOpenText(){
+  const st = _statusNow();
+  if (!st || !st.nextOpen) return '';
+
+  const map = {domingo:'Domingo',segunda:'Segunda',terca:'Terça',quarta:'Quarta',quinta:'Quinta',sexta:'Sexta',sabado:'Sábado'};
+  const dayName = map[st.nextOpen.dayKey] || st.nextOpen.dayKey;
+
+  const isToday = !st.nextOpen.offset;
+  const isTomorrow = st.nextOpen.offset === 1;
+  const hint = isToday ? ' (hoje)' : (isTomorrow ? ' (amanhã)' : '');
+
+  // monta “Abriremos Quarta (amanhã) às 18:00” ou “Abriremos (hoje) às 18:00”
+  const parts = [];
+  if (!isToday) parts.push(dayName);
+  if (hint) parts.push(hint);
+
+  return `Abriremos ${parts.join(' ')} às ${fmtHM(st.nextOpen.startMins)}`;
 }
+
 
   function isOpenNow(){
-    const sched=getSchedule(); if(!sched) return {open:null,nextText:''};
-    const now=new Date(); const key=todayKey(now); const slot=sched[key];
-    const now = new Date();
-if (window.isHoliday && window.isHoliday(now)){
-  return { open: false, nextText: calcNextOpenText(sched, now) };
-}
-    if(!slot) return {open:false,nextText:calcNextOpenText(sched, now)};
-    const mins=now.getHours()*60+now.getMinutes();
-    let open=false;
-    if (slot.overnight){ open = (mins>=slot.start || mins<=slot.end); }
-    else { open = (mins>=slot.start && mins<=slot.end); }
-    return {open,nextText: open ? '' : calcNextOpenText(sched, now)};
+    const st = _statusNow();
+    return { open: st.open, nextText: st.open ? '' : (calcNextOpenText() || '') };
   }
 
-  /* ---------- UI: selo no header ---------- */
+  /* ---------- helpers p/ banner fechado ---------- */
+  function displayDayName(key){
+    const map = {domingo:'Domingo',segunda:'Segunda',terca:'Terça',quarta:'Quarta',quinta:'Quinta',sexta:'Sexta',sabado:'Sábado'};
+    return map[key] || (key.charAt(0).toUpperCase()+key.slice(1));
+  }
+  function getNextOpenInfo(){
+    const st = _statusNow();
+    if (!st || !st.nextOpen) return null;
+    return {
+      isToday: !st.nextOpen.offset,
+      isTomorrow: st.nextOpen.offset === 1,
+      dayKey: st.nextOpen.dayKey,
+      dayName: displayDayName(st.nextOpen.dayKey),
+      timeText: fmtHM(st.nextOpen.startMins)
+    };
+  }
+
+  /* ---------- UI: selo no header (mantido; agora mostra hora de fechar) ---------- */
   function updateHeaderPill(){
     const headerRoot =
       document.querySelector('b\\:section#header') ||
@@ -994,14 +1104,14 @@ if (window.isHoliday && window.isHoliday(now)){
     if (!headerRoot) return;
     const slot=headerRoot.querySelector('.status-slot');
     if(!slot) return;
-    const {open}=isOpenNow();
+    const st=_statusNow();
     const pill=document.createElement('span');
-    pill.className='pill'+(open ? '' : ' closed');
-    pill.textContent=open ? 'DELIVERY ABERTO!' : 'DELIVERY FECHADO!';
+    pill.className='pill'+(st.open ? '' : ' closed');
+    pill.textContent = st.open ? ('DELIVERY ABERTO! • fechamos às ' + fmtHM(st.closeMins)) : 'DELIVERY FECHADO!';
     slot.innerHTML=''; slot.appendChild(pill);
   }
 
-  /* ---------- UI: bloquear finalização fora do horário ---------- */
+  /* ---------- UI: bloquear finalização fora do horário (igual) ---------- */
   function enforceCheckoutGuard(){
     const {open}=isOpenNow();
     const send=document.getElementById('btn-enviar-wa');
@@ -1023,115 +1133,50 @@ if (window.isHoliday && window.isHoliday(now)){
     } else if (banner){ banner.remove(); }
   }
 
-  // trava via captura (garante bloqueio mesmo se alguém tentar burlar)
-  document.addEventListener('click', function(e){
-    const send = e.target.closest?.('#btn-enviar-wa');
-    const go   = e.target.closest?.('#btn-ir-finalizar');
-    if (send || go){
-      const {open,nextText}=isOpenNow();
-      if (!open){
-        e.preventDefault(); e.stopImmediatePropagation();
-        alert('Estamos fechados no momento. ' + (nextText || 'Volte no nosso horário de atendimento.'));
-      }
-    }
-  }, true);
-
-
-
-
-
-  
-// ================================================================
-// Helpers: próxima abertura (DIA + HORÁRIO)
-// Requer: getSchedule(), todayKey(), fmtHM() já definidos no seu STATUS
-// ================================================================
-function displayDayName(key){
-  const map = {
-    domingo:'Domingo', segunda:'Segunda', terca:'Terça',
-    quarta:'Quarta',  quinta:'Quinta',   sexta:'Sexta',
-    sabado:'Sábado'
-  };
-  return map[key] || (key.charAt(0).toUpperCase()+key.slice(1));
-}
-
-function getNextOpenInfo(){
-  const sched = getSchedule();
-  if (!sched) return null;
-
-  const now = new Date();
-  const nowMins = now.getHours()*60 + now.getMinutes();
-  const today = todayKey(now);
-  const slot  = sched[today];
-
-  function buildInfo(dayKey, dayOffset, startMins){
-    return {
-      isToday: dayOffset===0,
-      isTomorrow: dayOffset===1,
-      dayKey,
-      dayName: displayDayName(dayKey),
-      timeText: fmtHM(startMins)
-    };
+  /* ---------- posicionamento da barra verde abaixo do header ---------- */
+  function __getHeaderOffsetPx(){
+    const headerRoot =
+      document.querySelector('b\\:section#header') ||
+      document.querySelector('.header.section') ||
+      document.querySelector('.header');
+    if (!headerRoot) return 0;
+    const cs = getComputedStyle(headerRoot);
+    const pos = cs.position;
+    const r = headerRoot.getBoundingClientRect();
+    if (pos === 'fixed' || pos === 'sticky' || r.top <= 0) return Math.max(0, r.bottom);
+    return 0;
   }
 
-  // tentar hoje
-  if (slot){
-    if (!slot.overnight){
-      if (nowMins < slot.start) return buildInfo(today, 0, slot.start);
-    } else {
-      // janela cruza a meia-noite (ex: 20:00–02:00). Se estamos fechados,
-      // a próxima abertura é "hoje" às slot.start.
-      if (nowMins <= slot.end || (nowMins > slot.end && nowMins < slot.start)){
-        return buildInfo(today, 0, slot.start);
-      }
-    }
-  }
-
-  // procurar nos próximos dias
-  for (let i=1;i<=7;i++){
-    const d = new Date(now); d.setDate(now.getDate()+i);
-    const k = todayKey(d);
-    const s = sched[k];
-    if (s) return buildInfo(k, i, s.start);
-  }
-  return null;
-}
-
-// ================================================================
-// --- BANNER GLOBAL "DELIVERY FECHADO" (cores personalizadas) ---
-// Substitui a sua versão antiga.
-// ================================================================
+  /* ---------- Banner global: vermelho (fechado) / verde FIXO (aberto) ---------- */
 function updateGlobalClosedBanner(){
-  // limpa as barras antes de redesenhar
+  const st = _statusNow();
+
+  // remove existentes para recriar
   document.getElementById('delivery-alert')?.remove();
   document.getElementById('delivery-open')?.remove();
 
-  const { open } = isOpenNow();
-  if (open === null) return;
+  if (st.open === null) return;
 
-  const headerRoot =
-    document.querySelector('b\\:section#header') ||
-    document.querySelector('.header.section') ||
-    document.querySelector('.header');
-
-  // === ABERTO: barra VERDE, MESMO ESTILO, porém SEM position ===
-  if (open === true){
+  // === ABERTO: barra VERDE com o MESMO ESTILO do aviso de fechado,
+  // inserida logo abaixo do header e sem "fixed"/"sticky" ===
+  if (st.open === true){
     const bar = document.createElement('div');
     bar.id = 'delivery-open';
     bar.setAttribute('role','status');
     bar.setAttribute('aria-live','polite');
     bar.style.cssText = [
-      // (sem position → não acompanha o scroll)
+      // (sem position → default = static; NÃO acompanha o scroll)
       'background:#16a34a','color:#fff',
       'border-bottom:1px solid #86efac',
       'padding:10px 12px','text-align:center',
       'font-weight:700','font-size:14px'
     ].join(';');
+    bar.textContent = 'Estamos abertos agora. Fechamos às ' + fmtHM(st.closeMins) + '.';
 
-    // se quiser mostrar a hora de fechar, derive de getSchedule() aqui
-    const sched = getSchedule(); const key = todayKey(new Date());
-    const slot = sched && sched[key]; 
-    const closes = slot ? fmtHM(slot.end) : '';
-    bar.textContent = closes ? ('Estamos abertos agora. Fechamos às ' + closes + '.') : 'Estamos abertos agora.';
+    const headerRoot =
+      document.querySelector('b\\:section#header') ||
+      document.querySelector('.header.section') ||
+      document.querySelector('.header');
 
     if (headerRoot && headerRoot.parentNode){
       headerRoot.parentNode.insertBefore(bar, headerRoot.nextSibling);
@@ -1141,19 +1186,12 @@ function updateGlobalClosedBanner(){
     return;
   }
 
-  // === FECHADO (ou feriado): VERMELHA sticky e SEM "na" ===
-  // reaproveita seu helper getNextOpenInfo() se existir; senão usamos calcNextOpenText
+  // === FECHADO: mantém o banner VERMELHO sticky como já estava ===
+  const info = getNextOpenInfo();
   let whenText = 'em breve.';
-  if (typeof getNextOpenInfo === 'function'){
-    const info = getNextOpenInfo();
-    if (info){
-      const hint = info.isToday ? ' (hoje)' : (info.isTomorrow ? ' (amanhã)' : '');
-      // sem "na":
-      whenText = `${info.isToday ? '' : info.dayName}${hint} às ${info.timeText}.`.replace(/^ /,'');
-    }
-  } else {
-    // fallback simples baseado no texto calculado
-    whenText = (calcNextOpenText(getSchedule(), new Date()) || 'em breve.');
+  if (info){
+    const hint = info.isToday ? ' (hoje)' : (info.isTomorrow ? ' (amanhã)' : '');
+    whenText = `${info.isToday ? '' : info.dayName}${hint} às ${info.timeText}.`.replace(/^ /,'');
   }
 
   const bar = document.createElement('div');
@@ -1168,8 +1206,12 @@ function updateGlobalClosedBanner(){
     'font-weight:700','font-size:14px'
   ].join(';');
 
-  bar.textContent = `Estamos fechados agora. Abrimos ${whenText}`;
+  const headerRoot =
+    document.querySelector('b\\:section#header') ||
+    document.querySelector('.header.section') ||
+    document.querySelector('.header');
 
+  bar.textContent = `Estamos fechados agora. Abriremos ${whenText}`;
   if (headerRoot && headerRoot.parentNode){
     headerRoot.parentNode.insertBefore(bar, headerRoot.nextSibling);
   } else {
@@ -1178,15 +1220,28 @@ function updateGlobalClosedBanner(){
 }
 
 
-  
+  // trava via captura (mantido)
+  document.addEventListener('click', function(e){
+    const send = e.target.closest?.('#btn-enviar-wa');
+    const go   = e.target.closest?.('#btn-ir-finalizar');
+    if (send || go){
+      const {open,nextText}=isOpenNow();
+      if (!open){
+        e.preventDefault(); e.stopImmediatePropagation();
+        alert('Estamos fechados no momento. ' + (nextText || 'Volte no nosso horário de atendimento.'));
+      }
+    }
+  }, true);
 
-
-  
-  function tick(){ updateHeaderPill(); enforceCheckoutGuard(); updateGlobalClosedBanner();}
+  // mesmo tick do seu código
+  function tick(){ updateHeaderPill(); enforceCheckoutGuard(); updateGlobalClosedBanner(); }
   if (document.readyState==='loading') document.addEventListener('DOMContentLoaded', tick);
   else tick();
   setInterval(tick, 60*1000);
+
 })();
+
+
 
 
     /* ====== NOTIFICAÇÕES ====== */
