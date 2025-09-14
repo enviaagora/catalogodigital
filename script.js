@@ -312,6 +312,30 @@ function getDeliveryFeesFromWidget(){
   for (var i=0;i<anchors.length;i++){ if (/taxa|entrega/.test(anchors[i].lower)){ item = anchors[i]; break; } }
   return parseFeesString(item && item.value);
 }
+// --- FERIADOS (dd-mm ou dd/mm, separados por vírgula/ponto-e-vírgula/linha) ---
+function parseHolidayList(s){
+  s = String(s||'').trim(); if(!s) return [];
+  return s.split(/[,;\n]+/).map(t=>{
+    const m = String(t||'').trim().match(/^(\d{1,2})[\/\-](\d{1,2})$/);
+    if(!m) return null;
+    const d = Math.max(1, Math.min(31, parseInt(m[1],10)||0));
+    const mth = Math.max(1, Math.min(12, parseInt(m[2],10)||0));
+    return d && mth ? {d, m:mth} : null;
+  }).filter(Boolean);
+}
+function getHolidaysFromWidget(){
+  const anchors = _getConfigAnchors();
+  let item = null;
+  for (let i=0;i<anchors.length;i++){
+    if (/feriado/.test(anchors[i].lower)){ item = anchors[i]; break; }
+  }
+  return parseHolidayList(item && item.value);
+}
+function isHoliday(date){
+  const list = (window.__HOLIDAYS__||[]);
+  const d = date.getDate(), m = date.getMonth()+1;
+  return list.some(h => h.d===d && h.m===m);
+}
 
 
 
@@ -814,6 +838,7 @@ document.addEventListener('DOMContentLoaded', function(){
   TAXAS_ENTREGA = getDeliveryFeesFromWidget() || [];
   ensureBairroUI();
   CUPONS_DISPONIVEIS = getCouponsFromWidget() || [];
+  window.__HOLIDAYS__ = getHolidaysFromWidget() || [];
   loadActiveCoupon();
   ensureCupomUI();
   atualizarResumoFinalizar();
@@ -918,22 +943,40 @@ document.addEventListener('DOMContentLoaded', function(){
   }
 
   /* ---------- estado aberto/fechado ---------- */
-  function calcNextOpenText(sched, now){
-    const key=todayKey(now); const slot=sched[key];
-    const mins=now.getHours()*60+now.getMinutes();
-    if (slot && !slot.overnight && mins < slot.start){
-      return 'Abrimos às ' + fmtHM(slot.start);
+function calcNextOpenText(sched, now){
+  const minsNow = now.getHours()*60 + now.getMinutes();
+  // varre hoje + próximos 7 dias
+  for (let i=0;i<=7;i++){
+    const d = new Date(now); d.setDate(now.getDate()+i);
+    if (window.isHoliday && window.isHoliday(d)) continue; // pula feriado
+
+    const k = todayKey(d); const s = sched[k];
+    if (!s) continue;
+
+    if (i===0){
+      // hoje: só faz sentido se ainda não abriu (ou abrirá depois)
+      if (!s.overnight && minsNow < s.start){
+        return 'Abrimos às ' + fmtHM(s.start);
+      }
+      // overnight hoje (ex: 20:00–02:00): se ainda não começou e é hoje
+      if (s.overnight && (minsNow < s.start)){
+        return 'Abrimos às ' + fmtHM(s.start);
+      }
+      continue;
     }
-    for (let i=1;i<=7;i++){
-      const d=new Date(now); d.setDate(now.getDate()+i);
-      const k=todayKey(d); const s=sched[k];
-      if (s){ return (i===1 ? 'Amanhã' : 'Em breve') + ' às ' + fmtHM(s.start); }
-    }
-    return '';
+    // amanhã ou “em breve”
+    return (i===1 ? 'Amanhã' : 'Em breve') + ' às ' + fmtHM(s.start);
   }
+  return '';
+}
+
   function isOpenNow(){
     const sched=getSchedule(); if(!sched) return {open:null,nextText:''};
     const now=new Date(); const key=todayKey(now); const slot=sched[key];
+    const now = new Date();
+if (window.isHoliday && window.isHoliday(now)){
+  return { open: false, nextText: calcNextOpenText(sched, now) };
+}
     if(!slot) return {open:false,nextText:calcNextOpenText(sched, now)};
     const mins=now.getHours()*60+now.getMinutes();
     let open=false;
@@ -1058,51 +1101,80 @@ function getNextOpenInfo(){
 // Substitui a sua versão antiga.
 // ================================================================
 function updateGlobalClosedBanner(){
+  // limpa as barras antes de redesenhar
+  document.getElementById('delivery-alert')?.remove();
+  document.getElementById('delivery-open')?.remove();
+
   const { open } = isOpenNow();
+  if (open === null) return;
 
-  // Se aberto (true) ou indeterminado (null), remover banner
-  if (open !== false){
-    document.getElementById('delivery-alert')?.remove();
-    return;
-  }
+  const headerRoot =
+    document.querySelector('b\\:section#header') ||
+    document.querySelector('.header.section') ||
+    document.querySelector('.header');
 
-  const info = getNextOpenInfo(); // {dayName, timeText, isToday, isTomorrow}
-  let whenText = 'em breve.';
-  if (info){
-    const hint = info.isToday ? ' (hoje)' : (info.isTomorrow ? ' (amanhã)' : '');
-    // se quiser tirar o "na", troque por "Abrimos " + info.dayName...
-    whenText = `na ${info.dayName}${hint} às ${info.timeText}.`;
-  }
-
-  // cria / atualiza o banner
-  let bar = document.getElementById('delivery-alert');
-  if (!bar){
-    bar = document.createElement('div');
-    bar.id = 'delivery-alert';
+  // === ABERTO: barra VERDE, MESMO ESTILO, porém SEM position ===
+  if (open === true){
+    const bar = document.createElement('div');
+    bar.id = 'delivery-open';
     bar.setAttribute('role','status');
     bar.setAttribute('aria-live','polite');
     bar.style.cssText = [
-      'position:sticky','top:0','z-index:9998',
-      'background:#ff0000',            // sua cor de fundo
-      'color:#fff',                     // cor do texto
-      'border-bottom:1px solid #fecaca',// borda (ajuste se quiser)
+      // (sem position → não acompanha o scroll)
+      'background:#16a34a','color:#fff',
+      'border-bottom:1px solid #86efac',
       'padding:10px 12px','text-align:center',
       'font-weight:700','font-size:14px'
     ].join(';');
 
-    // insere logo abaixo do header; fallback: topo do body
-    const headerRoot =
-      document.querySelector('b\\:section#header') ||
-      document.querySelector('.header.section') ||
-      document.querySelector('.header');
+    // se quiser mostrar a hora de fechar, derive de getSchedule() aqui
+    const sched = getSchedule(); const key = todayKey(new Date());
+    const slot = sched && sched[key]; 
+    const closes = slot ? fmtHM(slot.end) : '';
+    bar.textContent = closes ? ('Estamos abertos agora. Fechamos às ' + closes + '.') : 'Estamos abertos agora.';
+
     if (headerRoot && headerRoot.parentNode){
       headerRoot.parentNode.insertBefore(bar, headerRoot.nextSibling);
     } else {
       document.body.insertBefore(bar, document.body.firstChild);
     }
+    return;
   }
 
+  // === FECHADO (ou feriado): VERMELHA sticky e SEM "na" ===
+  // reaproveita seu helper getNextOpenInfo() se existir; senão usamos calcNextOpenText
+  let whenText = 'em breve.';
+  if (typeof getNextOpenInfo === 'function'){
+    const info = getNextOpenInfo();
+    if (info){
+      const hint = info.isToday ? ' (hoje)' : (info.isTomorrow ? ' (amanhã)' : '');
+      // sem "na":
+      whenText = `${info.isToday ? '' : info.dayName}${hint} às ${info.timeText}.`.replace(/^ /,'');
+    }
+  } else {
+    // fallback simples baseado no texto calculado
+    whenText = (calcNextOpenText(getSchedule(), new Date()) || 'em breve.');
+  }
+
+  const bar = document.createElement('div');
+  bar.id = 'delivery-alert';
+  bar.setAttribute('role','status');
+  bar.setAttribute('aria-live','polite');
+  bar.style.cssText = [
+    'position:sticky','top:0','z-index:9998',
+    'background:#ff0000','color:#fff',
+    'border-bottom:1px solid #fecaca',
+    'padding:10px 12px','text-align:center',
+    'font-weight:700','font-size:14px'
+  ].join(';');
+
   bar.textContent = `Estamos fechados agora. Abrimos ${whenText}`;
+
+  if (headerRoot && headerRoot.parentNode){
+    headerRoot.parentNode.insertBefore(bar, headerRoot.nextSibling);
+  } else {
+    document.body.insertBefore(bar, document.body.firstChild);
+  }
 }
 
 
